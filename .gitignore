@@ -1,5 +1,4 @@
 simple-https-server.py
-opencv_wasm.js
+opencv_debug.js
 opencv_slam.js
-opencv_asm.js
 server.pem
