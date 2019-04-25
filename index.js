@@ -1,10 +1,18 @@
+// constants
 const PROCESSING_RESOLUTION_WIDTH = 480;
 const FPS = 30;
+const AKAZE_THRESH = 3e-4;
+const NN_MATCH_RATIO = 0.8;
+const RANSAC_THRESH = 2.5;
+const MIN_INLINER_RATIO = 0.25;
+const MIN_INLINER_NUMBER = 20;
 
 let width = 0;
 let height = 0;
 let streaming = false;
 let cap;
+let rect = {};
+let drag = false;
 
 let video = document.querySelector("#videoInput");
 let tempCanvas = document.querySelector("#tempCanvas");
@@ -22,7 +30,9 @@ let detector;
 let colorDescriptors;
 let grayDescriptors;
 let mask;
+let objectBB;
 
+// load Opencv.js module
 var Module = {
     setStatus: function(text) {
         console.log(text);
@@ -33,12 +43,14 @@ var Module = {
 };
 
 function init() {
+    // get camera
     navigator.mediaDevices.getUserMedia({video: true, audio: false})
     .then(function(stream) {
         let settings = stream.getVideoTracks()[0].getSettings();
+
+        // adjust video width and height to match the requirement
         width = PROCESSING_RESOLUTION_WIDTH;
         height = settings.height*PROCESSING_RESOLUTION_WIDTH/settings.width;
-        
         tempCanvas.setAttribute("width", width);
         tempCanvas.setAttribute("height", height);
         outputCanvas.setAttribute("width", width);
@@ -46,6 +58,7 @@ function init() {
 
         video.setAttribute("width", width);
         video.setAttribute("height", height);
+
         video.srcObject = stream;
         video.play();
 
@@ -56,39 +69,64 @@ function init() {
     });
 };
 
- function show_image(mat){
-    let data = mat.data;
-    let channels = mat.channels();
-    let ctx = outputCanvas.getContext("2d");
-    ctx.clearRect(0, 0, width, height);
-    imdata = ctx.createImageData(mat.cols, mat.rows);
-    for (var i = 0,j=0; i < data.length; i += channels, j+=4) {
-        imdata.data[j] = data[i];
-        imdata.data[j + 1] = data[i+1%channels];
-        imdata.data[j + 2] = data[i+2%channels];
-        imdata.data[j + 3] = 255;
+function mouseDown(e) {
+    // if clicked second image, do nothing
+    if (e.layerY > height) {
+        return;
     }
-    ctx.putImageData(imdata, 0, 0);
+
+    // save the frame as a reference
+    let src = new cv.Mat(height, width, cv.CV_8UC4);
+    cap.read(src);
+    cv.cvtColor(src, color, cv.COLOR_RGBA2RGB, 0);
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
+    src.delete();
+
+    // save the coordinate of first click
+    rect.x = e.layerX;
+    rect.y = e.layerY;
+    rect.w = 0;
+    rect.h = 0;
+
+    drag = true;
 }
 
-function drawKeypoints(img, keyPoints, color) {
-    for (i = 0 ; i < keyPoints.size() ; i++) {
-        cv.circle(img, keyPoints.get(i).pt, 0, color);
-        cv.circle(img, keyPoints.get(i).pt, 3, color);
+function mouseUp() {
+    drag = false;
+
+    // create an Mat for four vertices
+    if (!objectBB.isDeleted()) {
+        objectBB.delete();
     }
+    objectBB = new cv.Mat(4, 1, cv.CV_32FC2);
+    objectBB.data32F[0] = rect.x;
+    objectBB.data32F[1] = rect.y;
+    objectBB.data32F[2] = rect.x + rect.w;
+    objectBB.data32F[3] = rect.y;
+    objectBB.data32F[4] = rect.x + rect.w;
+    objectBB.data32F[5] = rect.y + rect.h;
+    objectBB.data32F[6] = rect.x;
+    objectBB.data32F[7] = rect.y + rect.h;
+
+    updateMask(mask, rect.x, rect.y, rect.w, rect.h);
+    detector.detect(color, colorKeyPoints, mask);
+    detector.detect(gray, grayKeyPoints, mask);
+    detector.compute(color, colorKeyPoints, colorDescriptors);
+    detector.compute(gray, grayKeyPoints, grayDescriptors);
+    drawBoundingBox(color, objectBB);
+    drawBoundingBox(gray, objectBB);
+
+    detactFeatures = true;
 }
 
-function drawMatches(img, keyPoints, img2, keyPoints2, matches, matchingImage, color) {
-    drawKeypoints(img, keyPoints, color);
-    matchingImage.data.set(img2.data);
-    matchingImage.data.set(img.data, img2.data.length);
-    for (i = 0; i < matches.size(); i++) {
-        let m = keyPoints2.get(matches.get(i).trainIdx).pt;
-        let n = keyPoints.get(matches.get(i).queryIdx).pt;
-        n = {x: n.x, y: n.y + img.rows};
-        cv.circle(matchingImage, m, 0, color);
-        cv.circle(matchingImage, m, 3, color);
-        cv.line(matchingImage, m, n, color);
+function mouseMove(e) {
+    if (drag) {
+        rect.w = e.layerX - rect.x;
+        if (e.layerY > height) {
+            rect.h = height - rect.y;
+        } else {
+            rect.h = e.layerY - rect.y;
+        }
     }
 }
 
@@ -98,8 +136,6 @@ function start() {
     startAndStopButton.innerHTML = "Stop";
     colorButton.style.display = "block";
 
-    let ctx = tempCanvas.getContext("2d");
-
     // first frame
     color = new cv.Mat(height, width, cv.CV_8UC3);
     colorKeyPoints = new cv.KeyPointVector();
@@ -108,16 +144,13 @@ function start() {
     grayKeyPoints = new cv.KeyPointVector();
     grayDescriptors = new cv.Mat();
 
-
     // other frames
     let color2 = new cv.Mat(height, width, cv.CV_8UC3);
-    let colorKeyPoints2 = new cv.KeyPointVector();
-    let colorDescriptors2 = new cv.Mat();
     let colorMatchingImage = new cv.Mat(2*height, width, cv.CV_8UC3);
     let gray2 = new cv.Mat(height, width, cv.CV_8UC1);
-    let grayKeyPoints2 = new cv.KeyPointVector();
-    let grayDescriptors2 = new cv.Mat();
     let grayMatchingImage = new cv.Mat(2*height, width, cv.CV_8UC1);
+    let newKeyPoints = new cv.KeyPointVector();
+    let newDescriptors = new cv.Mat();
 
     // other variables
     cap = new cv.VideoCapture(video);
@@ -128,11 +161,30 @@ function start() {
     let sc = new cv.Scalar(0, 255, 0, 0);
     mask = new cv.Mat(height, width, cv.CV_8UC1);
     let matcher = new cv.BFMatcher(2, false);
-    const ratio = 0.8;
+    let homography = new cv.Mat();
+    let inlierMask = new cv.Mat();
+    let newBB = new cv.Mat();
     let count = 0;
+    objectBB = new cv.Mat();
+
+    let originalFrame;
+    let originalKeyPoints;
+    let originalDescriptors;
+    let newFrame;
+
+    // add canvas event listeners
+    outputCanvas.addEventListener('mousedown', mouseDown, false);
+    outputCanvas.addEventListener('mouseup', mouseUp, false);
+    outputCanvas.addEventListener('mousemove', mouseMove, false);
 
     function processVideo() {
         if (!streaming) {
+            // remove canvas event listeners
+            outputCanvas.removeEventListener('mousedown', mouseDown, false);
+            outputCanvas.removeEventListener('mouseup', mouseUp, false);
+            outputCanvas.removeEventListener('mousemove', mouseMove, false);
+
+            // remove onjects
             color.delete();
             colorKeyPoints.delete();
             colorDescriptors.delete();
@@ -141,71 +193,157 @@ function start() {
             grayDescriptors.delete();
 
             color2.delete();
-            colorKeyPoints2.delete();
-            colorDescriptors2.delete();
             colorMatchingImage.delete();
             gray2.delete();
-            grayKeyPoints2.delete();
-            grayDescriptors2.delete();
             grayMatchingImage.delete();
+            newKeyPoints.delete();
+            newDescriptors.delete();
 
             src.delete();
             detector.delete();
             mask.delete();
+            objectBB.delete();
 
             matcher.delete();
+            homography.delete();
+            inlierMask.delete();
+
             return;
         }
 
         try {
             let begin = performance.now();
             cap.read(src);
-            if (detactFeatures) {
+            if (usingGray) {
+                cv.cvtColor(src, gray2, cv.COLOR_RGBA2GRAY, 0);
+                originalFrame = gray;
+                originalKeyPoints = grayKeyPoints;
+                originalDescriptors = grayDescriptors;
+                newFrame = gray2;
+            } else {
+                cv.cvtColor(src, color2, cv.COLOR_RGBA2RGB, 0);
+                originalFrame = color;
+                originalKeyPoints = colorKeyPoints;
+                originalDescriptors = colorDescriptors;
+                newFrame = color2;
+            }
+
+            if (drag) {
+                newFrame.data.set(originalFrame.data);
+                cv.rectangle(newFrame, {x: rect.x, y:rect.y}, {x: rect.x+rect.w, y: rect.y+rect.h}, [255, 0, 0, 255]);
+                cv.imshow("outputCanvas", newFrame);
+            } else if (detactFeatures) {
                 let matches = new cv.DMatchVectorVector();
                 let goodMatches = new cv.DMatchVector();
+                let inliers1 = new cv.KeyPointVector();
+                let inliers2 = new cv.KeyPointVector();
+                let inlierMatches = new cv.DMatchVector();
 
-                if (usingGray) {
-                    cv.cvtColor(src, gray2, cv.COLOR_RGBA2GRAY, 0);
-                    detector.detect(gray2, grayKeyPoints2);
-                    detector.compute(gray2, grayKeyPoints2, grayDescriptors2);
-                    matcher.knnMatch(grayDescriptors, grayDescriptors2, matches, 2);
-                    // drawKeypoints(gray2, grayKeyPoints2, sc);
-                    for (let i = 0; i < matches.size(); i++) {
-                        if (matches.get(i).size() < 2) {
-                            continue;
-                        }
-                        let m = matches.get(i).get(0);
-                        let n = matches.get(i).get(1);
-                        if (m.distance < ratio * n.distance) {
-                            goodMatches.push_back(m);
-                        }
+                detector.detect(newFrame, newKeyPoints);
+                detector.compute(newFrame, newKeyPoints, newDescriptors);
+                matcher.knnMatch(originalDescriptors, newDescriptors, matches, 2);
+                for (let i = 0; i < matches.size(); i++) {
+                    if (matches.get(i).size() < 2) {
+                        continue;
                     }
-                    drawMatches(gray, grayKeyPoints, gray2, grayKeyPoints2, goodMatches, grayMatchingImage, sc);
-                    cv.imshow("outputCanvas", grayMatchingImage);
-                } else {
-                    cv.cvtColor(src, color2, cv.COLOR_RGBA2RGB, 0);
-                    detector.detect(color2, colorKeyPoints2);
-                    detector.compute(color2, colorKeyPoints2, colorDescriptors2);
-                    matcher.knnMatch(colorDescriptors, colorDescriptors2, matches, 2);
-                    // drawKeypoints(color2, colorKeyPoints2, sc);
-                    for (let i = 0; i < matches.size(); i++) {
-                        if (matches.get(i).size() < 2) {
-                            continue;
-                        }
-                        let m = matches.get(i).get(0);
-                        let n = matches.get(i).get(1);
-                        if (m.distance < ratio * n.distance) {
-                            goodMatches.push_back(m);
-                        }
+                    let m = matches.get(i).get(0);
+                    let n = matches.get(i).get(1);
+                    if (m.distance < NN_MATCH_RATIO * n.distance) {
+                        goodMatches.push_back(m);
                     }
-                    drawMatches(color, colorKeyPoints, color2, colorKeyPoints2, goodMatches, colorMatchingImage, sc);
-                    cv.imshow("outputCanvas", colorMatchingImage);
                 }
 
-                matches.delete();
+                let matched1 = new cv.Mat(goodMatches.size(), 1, cv.CV_32FC2);
+                let matched2 = new cv.Mat(goodMatches.size(), 1, cv.CV_32FC2);
+                for (let i = 0; i < goodMatches.size(); i++) {
+                    matched1.data32F[2 * i] = originalKeyPoints.get(goodMatches.get(i).queryIdx).pt.x;
+                    matched1.data32F[2 * i + 1] = originalKeyPoints.get(goodMatches.get(i).queryIdx).pt.y;
+                    matched2.data32F[2 * i] = newKeyPoints.get(goodMatches.get(i).trainIdx).pt.x;
+                    matched2.data32F[2 * i + 1] = newKeyPoints.get(goodMatches.get(i).trainIdx).pt.y;
+                }
+
+                if (goodMatches.size() >= 4) {
+                    homography = cv.findHomography(matched1, matched2, cv.RANSAC, RANSAC_THRESH, inlierMask);
+
+                    if (!homography.empty()) {
+                        for (let i = 0; i < goodMatches.size(); i++) {
+                            if (inlierMask.charAt(i) == 1) {
+                                inlierMatches.push_back(goodMatches.get(i));
+                            }
+                        }
+
+                        cv.perspectiveTransform(objectBB, newBB, homography);
+                        if (inlierMatches.size() / matches.size() >= MIN_INLINER_RATIO || inlierMatches.size() >= MIN_INLINER_NUMBER) {
+                            drawBoundingBox(newFrame, newBB);
+                        }
+                    }
+                }
+
+                if (usingGray) {
+                    drawMatches(originalFrame, originalKeyPoints, newFrame, newKeyPoints, inlierMatches, grayMatchingImage, sc);
+                    cv.imshow("outputCanvas", grayMatchingImage);
+                } else {
+                    drawMatches(originalFrame, originalKeyPoints, newFrame, newKeyPoints, inlierMatches, colorMatchingImage, sc);
+                    cv.imshow("outputCanvas", colorMatchingImage);
+                }
+                // Image dimensions
+                let w = newFrame.cols;
+                let h = newFrame.rows;
+
+                // Normalized dimensions:
+                let maxSize = Math.max(w,h);
+                let unitW = w / maxSize;
+                let unitH = h / maxSize;
+
+                let points2d = new cv.Mat(4, 1, cv.CV_32FC2);
+                for (let i = 0; i < points2d.data32F.length; i++) {
+                    points2d.data32F[i] = 0;
+                }
+                points2d.data32F[2] = w;
+                points2d.data32F[4] = w;
+                points2d.data32F[5] = h;
+                points2d.data32F[7] = h;
+
+                let points3d = new cv.Mat(4, 1, cv.CV_32FC3);
+                for (let i = 0; i < points3d.data32F.length; i++) {
+                    points3d.data32F[i] = 0;
+                }
+                points3d.data32F[0] = -unitW;
+                points3d.data32F[1] = -unitH;
+                points3d.data32F[3] = unitW;
+                points3d.data32F[4] = -unitH;
+                points3d.data32F[7] = unitW;
+                points3d.data32F[8] = unitH;
+                points3d.data32F[10] = -unitW;
+                points3d.data32F[11] = unitH;
+
+                let m_intrinsic = new cv.Mat(3, 3, cv.CV_32FC1);
+                for (let i = 0; i < m_intrinsic.data32F.length; i++) {
+                    m_intrinsic.data32F[i] = 0;
+                }
+                m_intrinsic.data32F[4] = 526.58037684199849;
+                m_intrinsic.data32F[0] = 524.65577209994706;
+                m_intrinsic.data32F[3] = 318.41744018680112;
+                m_intrinsic.data32F[5] = 202.96659047014398;
+                m_intrinsic.data32F[8] = 1;
+
+                let m_distortion = new cv.Mat(5, 1, cv.CV_32FC1);
+                for (let i = 0; i < 5; i++) {
+                    m_distortion.data32F[i] = 0;
+                }
+
+                let rvec = new cv.Mat();
+                let tvec = new cv.Mat();
+                cv.solvePnP(points3d, points2d, m_intrinsic, m_distortion, rvec, tvec);
+
+                matched1.delete();
+                matched2.delete();
                 goodMatches.delete();
+                inliers1.delete();
+                inliers2.delete();
+                inlierMatches.delete();
             } else {
-                cv.imshow("outputCanvas", src);
+                cv.imshow("outputCanvas", newFrame);
             }
 
             let delta = performance.now() - begin;
@@ -225,6 +363,7 @@ function start() {
     setTimeout(processVideo, 0);
 }
 
+// toggle start and stop
 startAndStopButton.addEventListener('click', () => {
     if (streaming) {
         streaming = false;
@@ -236,6 +375,7 @@ startAndStopButton.addEventListener('click', () => {
     }
 });
 
+// toggle color and gray mode
 colorButton.addEventListener('click', () => {
     usingGray = !usingGray;
     if (usingGray) {
@@ -243,61 +383,4 @@ colorButton.addEventListener('click', () => {
     } else {
         colorButton.innerHTML = "Gray";
     }
-});
-
-function updateMask(x, y, w, h) {
-    for (i=0; i < mask.data.length; i++) {
-        mask.data[i] = 0;
-    }
-
-    for (i=y; i < y + h; i++) {
-        for (j=x; j < x + w; j++) {
-            mask.data[i*width + j] = 1;
-        }
-    }
-}
-
-outputCanvas.addEventListener('click', (e) => {
-    if (!streaming || e.layerY > height) {
-        return;
-    }
-
-    let w = width/4;
-    let h = height/2;
-    let x = 0;
-    let y = 0;
-
-    if (e.layerX < w/2) {
-        x = 0;
-    } else if (e.layerX + w/2 > width) {
-        x = width - w;
-    } else {
-        x = e.layerX - w/2;
-    }
-
-    if (e.layerY < h/2) {
-        y = 0;
-    } else if (e.layerY + h/2 > height) {
-        y = height - h;
-    } else {
-        y = e.layerY - h/2;
-    }
-
-    let src = new cv.Mat(height, width, cv.CV_8UC4);
-    cap.read(src);
-
-    cv.cvtColor(src, color, cv.COLOR_RGBA2RGB, 0);
-    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-
-    updateMask(x, y, w, h);
-    detector.detect(color, colorKeyPoints, mask);
-    detector.detect(gray, grayKeyPoints, mask);
-    detector.compute(color, colorKeyPoints, colorDescriptors);
-    detector.compute(gray, grayKeyPoints, grayDescriptors);
-    cv.rectangle(color, {x:x, y:y}, {x:x+w, y:y+h}, [255, 0, 0, 255]);
-    cv.rectangle(gray, {x:x, y:y}, {x:x+w, y:y+h}, [255, 0, 0, 255]);
-
-    detactFeatures = true;
-
-    src.delete();
 });
